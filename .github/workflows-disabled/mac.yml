@@ -1,0 +1,256 @@
+name: MacOS.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and upload to
+        required: true
+        type: string
+      runner:
+        description: macOS runner label selected by the release dispatcher
+        required: true
+        type: string
+
+env:
+  REPO_TAG: ${{ inputs.tag }}
+
+jobs:
+
+  prepare-libraries:
+    name: Prepare Libraries
+    runs-on: ${{ inputs.runner }}
+
+    strategy:
+      matrix:
+        defines:
+          - ""
+    env:
+      REPO_NAME: ${{ github.event.repository.name }}
+      UPLOAD_ARTIFACT: "true"
+      ONLY_CACHE: "false"
+      PREPARE_PATH: "Telegram/build/prepare/prepare.py"
+
+    steps:
+      - name: Clone.
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          ref: refs/tags/${{ env.REPO_TAG }}
+          path: ${{ env.REPO_NAME }}
+
+      - name: First set up.
+        run: |
+          sudo chown -R `whoami`:admin /usr/local/share
+
+          brew update
+          brew upgrade || true
+          brew install automake libtool meson nasm ninja pkg-config
+
+          # Disable spotlight.
+          sudo mdutil -a -i off
+
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+          sudo sed -i '' '/CMAKE_${lang}_FLAGS_DEBUG_INIT/s/ -g//' /opt/homebrew/share/cmake/Modules/Compiler/GNU.cmake
+
+      - name: Restore libraries cache.
+        id: cache-libs
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            Libraries
+            ThirdParty
+          key: ${{ runner.OS }}-libs-v2-${{ hashFiles(format('{0}/{1}', env.REPO_NAME, env.PREPARE_PATH)) }}
+          restore-keys: ${{ runner.OS }}-libs-v2-
+
+      - name: Libraries.
+        id: build-libs
+        run: |
+          ./$REPO_NAME/Telegram/build/prepare/mac.sh skip-debug silent
+
+      # Cached Rust sources and generated bindings are needed by later builds.
+      - name: Free up some disk space.
+        run: find Libraries '(' '(' ! '(' -name '*.a' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -name 'macos_toolchain.json' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -path '*/src/wallet_engine/*' -o '(' '(' -path '*/tlottie/*' -o -path '*/wallet-engine/*' ')' ! -path '*/target/*' ')' -o -perm +111 ')' -type f ')' -o '(' -empty ! -path '*/tlottie/*' ! -path '*/wallet-engine/*' ')' ')' -delete
+
+      - name: Save libraries cache.
+        if: always() && steps.cache-libs.outcome == 'success' && steps.build-libs.outcome == 'success' && steps.cache-libs.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            Libraries
+            ThirdParty
+          key: ${{ steps.cache-libs.outputs.cache-primary-key }}
+
+  build:
+    name: MacOS
+    runs-on: ${{ inputs.runner }}
+    needs: prepare-libraries
+    permissions:
+      contents: write
+
+    concurrency:
+      group: yurigram-channel-update-${{ matrix.arch == 'arm64' && 'armac' || 'mac' }}
+      cancel-in-progress: false
+      queue: max
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+        defines:
+          - ""
+    env:
+      REPO_NAME: ${{ github.event.repository.name }}
+      UPLOAD_ARTIFACT: "true"
+      ONLY_CACHE: "false"
+      PREPARE_PATH: "Telegram/build/prepare/prepare.py"
+
+    steps:
+      - name: Clone.
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          ref: refs/tags/${{ env.REPO_TAG }}
+          path: ${{ env.REPO_NAME }}
+
+      - name: Restore libraries cache.
+        id: cache-libs
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            Libraries
+            ThirdParty
+          key: ${{ runner.OS }}-libs-v2-${{ hashFiles(format('{0}/{1}', env.REPO_NAME, env.PREPARE_PATH)) }}
+          restore-keys: ${{ runner.OS }}-libs-v2-
+
+      - name: Configure.
+        run: |
+          cd $REPO_NAME/Telegram
+          ./configure.sh \
+          -D CMAKE_CONFIGURATION_TYPES=Release \
+          -D CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
+          -D TDESKTOP_API_ID=${{ secrets.API_ID }} \
+          -D TDESKTOP_API_HASH=${{ secrets.API_HASH }} \
+          -D DESKTOP_APP_MAC_ARCH=${{ matrix.arch }} \
+          -D DESKTOP_APP_DISABLE_AUTOUPDATE=OFF \
+          -D YURIGRAM_BUILD_UPDATE_TOOLS=ON \
+          -D CMAKE_EXE_LINKER_FLAGS="-Wl,-x"
+
+      - name: Telegram Desktop build.
+        if: env.ONLY_CACHE == 'false'
+        run: |
+          cd $REPO_NAME/Telegram
+          cmake --build ../out --config Release --parallel
+
+      - name: Move artifact.
+        id: prepare-artifact
+        if: env.UPLOAD_ARTIFACT == 'true'
+        run: |
+          cd $REPO_NAME
+          VERSION="$REPO_TAG"
+          cd out/Release
+          mkdir -p Yurigram.app/Contents/Frameworks
+          cp Updater Yurigram.app/Contents/Frameworks/Updater
+          chmod 755 Yurigram.app/Contents/Frameworks/Updater
+          mkdir artifact
+          mv Yurigram.app artifact/
+          if [ "${{ matrix.arch }}" == "arm64" ]; then
+          	PLATFORM="AppleSilicon"
+          else
+            PLATFORM="Intel"
+          fi
+          echo "name=Yurigram_MacOS_${VERSION}_${PLATFORM}" >> $GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v7
+        if: env.UPLOAD_ARTIFACT == 'true'
+        name: Upload artifact.
+        with:
+          name: ${{ steps.prepare-artifact.outputs.name }}
+          path: ${{ env.REPO_NAME }}/out/Release/artifact/
+
+      - name: Pack and sign update.
+        id: pack-update
+        if: env.UPLOAD_ARTIFACT == 'true' && env.ONLY_CACHE == 'false'
+        env:
+          UPDATE_SIGNING_PRIVATE_KEY: ${{ secrets.UPDATE_SIGNING_PRIVATE_KEY }}
+          UPDATE_SIGNING_KEY_ID: yurigram-release-20261011
+        run: |
+          set -euo pipefail
+          if [ -z "$UPDATE_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::The UPDATE_SIGNING_PRIVATE_KEY secret must contain the release Ed25519 private key in PEM format."
+            exit 1
+          fi
+          REPO="$GITHUB_WORKSPACE/$REPO_NAME"
+          VERSION=$(sed -nE 's/^constexpr auto AppVersion = ([0-9]+);$/\1/p' "$REPO/Telegram/SourceFiles/core/version.h")
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not read AppVersion from core/version.h."
+            exit 1
+          fi
+
+          umask 077
+          KEY_FILE=$(mktemp "$RUNNER_TEMP/yurigram-update-key.XXXXXX")
+          trap 'rm -f "$KEY_FILE"' EXIT
+          printf '%s\n' "$UPDATE_SIGNING_PRIVATE_KEY" > "$KEY_FILE"
+          unset UPDATE_SIGNING_PRIVATE_KEY
+
+          cd "$REPO/out/Release"
+          mkdir update-artifact
+          cd update-artifact
+          ../Packer -path ../artifact/Yurigram.app \
+            -arch "${{ matrix.arch }}" -version "$VERSION" \
+            -channel stable -keys-loc "$REPO/Telegram/Resources/update" \
+            -local-key "$KEY_FILE" -local-key-id "$UPDATE_SIGNING_KEY_ID"
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            UPDATE_ARCH=arm
+          else
+            UPDATE_ARCH=x64
+          fi
+          PACKAGE="$PWD/td-update-mac-$UPDATE_ARCH-$VERSION"
+          test -f "$PACKAGE"
+          echo "package=$PACKAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload update artifact.
+        if: env.UPLOAD_ARTIFACT == 'true' && env.ONLY_CACHE == 'false'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.prepare-artifact.outputs.name }}_Update
+          path: ${{ env.REPO_NAME }}/out/Release/update-artifact/td-update-*
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Package release artifact.
+        id: package-release
+        if: env.UPLOAD_ARTIFACT == 'true'
+        run: |
+          ARCHIVE="$REPO_NAME/out/Release/${{ steps.prepare-artifact.outputs.name }}.zip"
+          (
+            cd "$REPO_NAME/out/Release/artifact"
+            zip -r -y "../${{ steps.prepare-artifact.outputs.name }}.zip" Yurigram.app
+          )
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release package.
+        if: env.UPLOAD_ARTIFACT == 'true'
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ inputs.tag }}
+          file: ${{ steps.package-release.outputs.archive }}
+
+      - name: Publish Telegram update.
+        if: env.UPLOAD_ARTIFACT == 'true' && env.ONLY_CACHE == 'false'
+        timeout-minutes: 20
+        env:
+          UPDATE_API_ID: ${{ secrets.UPDATE_API_ID }}
+          UPDATE_API_HASH: ${{ secrets.UPDATE_API_HASH }}
+          UPDATE_BOT_TOKEN: ${{ secrets.UPDATE_BOT_TOKEN }}
+          UPDATE_CHAT_ID: ${{ secrets.UPDATE_CHAT_ID }}
+          UPDATE_PLATFORM: ${{ matrix.arch == 'arm64' && 'armac' || 'mac' }}
+          UPDATE_PACKAGE: ${{ steps.pack-update.outputs.package }}
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/yurigram-update-publisher"
+          UPDATE_PYTHON="$RUNNER_TEMP/yurigram-update-publisher/bin/python"
+          "$UPDATE_PYTHON" -m pip install Telethon==1.45.0
+          "$UPDATE_PYTHON" "$REPO_NAME/Telegram/build/publish_update.py" --platform "$UPDATE_PLATFORM" --package "$UPDATE_PACKAGE" --chat-id "$UPDATE_CHAT_ID"

@@ -1,0 +1,61 @@
+name: Build Debug
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      IMAGE_TAG: tdesktop:centos_env
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+
+      - name: Build dependencies image
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          cd Telegram/build/docker/centos_env
+          poetry install
+          DEBUG= LTO= poetry run gen_dockerfile > Dockerfile
+          DOCKER_BUILDKIT=1 docker build -t $IMAGE_TAG .
+
+      - name: Build Yurigram Debug
+        run: |
+          docker run --rm \
+            -u $(id -u) \
+            -v $PWD:/usr/src/tdesktop \
+            -e CONFIG=Debug \
+            $IMAGE_TAG \
+            /usr/src/tdesktop/Telegram/build/docker/centos_env/build.sh \
+            -D CMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF \
+            -D TDESKTOP_API_ID=${{ secrets.API_ID || '611335' }} \
+            -D TDESKTOP_API_HASH=${{ secrets.API_HASH || 'd524b414d21f4d37f08684c1df41ac9c' }} \
+            -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON \
+            -D DESKTOP_APP_DISABLE_CRASH_REPORTS=OFF
+
+      - name: Check output
+        run: |
+          BIN=""
+          for f in out/Debug/Yurigram out/Debug/yurigram out/Yurigram out/yurigram; do
+            if test -f "$f"; then BIN="$f"; break; fi
+          done
+          if test -z "$BIN"; then
+            BIN=$(find out -maxdepth 3 -type f \( -name Yurigram -o -name yurigram \) | head -1)
+          fi
+          test -n "$BIN" || (echo "binary not found"; exit 1)
+          ls -lh "$BIN"
+          cp "$BIN" Yurigram-debug
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: Yurigram-debug
+          path: Yurigram-debug

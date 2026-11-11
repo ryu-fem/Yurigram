@@ -1,0 +1,389 @@
+name: Windows.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and upload to
+        required: true
+        type: string
+      runner_x64:
+        description: Windows x64 runner label selected by the release dispatcher
+        required: true
+        type: string
+      runner_arm64:
+        description: Windows ARM64 runner label selected by the release dispatcher
+        required: true
+        type: string
+
+env:
+  REPO_TAG: ${{ inputs.tag }}
+
+jobs:
+
+  windows:
+    name: Windows
+    runs-on: ${{ matrix.arch == 'arm64' && inputs.runner_arm64 || inputs.runner_x64 }}
+    permissions:
+      contents: write
+
+    concurrency:
+      group: yurigram-channel-update-${{ matrix.arch == 'arm64' && 'winarm' || 'win64' }}
+      cancel-in-progress: false
+      queue: max
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        qt: ["", qt6]
+        generator: ["Ninja Multi-Config"]
+        exclude:
+          - arch: arm64
+            qt: ""
+          - arch: x64
+            qt: qt6
+
+    env:
+      UPLOAD_ARTIFACT: "true"
+      ONLY_CACHE: "false"
+      PREPARE_PATH: "Telegram/build/prepare/prepare.py"
+
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      - name: Prepare directories.
+        run: |
+          if "${{ matrix.arch }}"=="x64" (
+            if exist "D:\" (
+              set "TBUILD_TARGET=D:\TBuild"
+            ) else (
+              set "TBUILD_TARGET=%userprofile%\TBuild"
+            )
+          ) else (
+            set "TBUILD_TARGET=%userprofile%\TBuild"
+          )
+          if not exist "%TBUILD_TARGET%\Libraries" mkdir "%TBUILD_TARGET%\Libraries"
+          if not exist "%TBUILD_TARGET%\tmp" mkdir "%TBUILD_TARGET%\tmp"
+          mklink /d "%GITHUB_WORKSPACE%\TBuild" "%TBUILD_TARGET%"
+          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries${{ matrix.arch == 'x64' && '\win64' || '' }}>>%GITHUB_ENV%
+          echo TEMP=%TBUILD_TARGET%\tmp>>%GITHUB_ENV%
+          echo TMP=%TBUILD_TARGET%\tmp>>%GITHUB_ENV%
+          echo TMPDIR=%TBUILD_TARGET%\tmp>>%GITHUB_ENV%
+
+      - name: Get repository name.
+        shell: bash
+        run: echo "REPO_NAME=${GITHUB_REPOSITORY##*/}" >> $GITHUB_ENV
+
+      - name: Clone.
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          ref: refs/tags/${{ env.REPO_TAG }}
+          path: TBuild/${{ env.REPO_NAME }}
+
+      - name: First set up.
+        shell: bash
+        run: |
+          DOCPATH=$TBUILD/$REPO_NAME/docs/building-win.md
+          SDK="$(grep "SDK version" $DOCPATH | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+
+          sed -i '/CMAKE_${lang}_FLAGS_DEBUG_INIT/s/${_Zi}//' "$PROGRAMFILES"/CMake/share/cmake*/Modules/Platform/Windows-MSVC.cmake
+
+          echo "$(sha256sum $TBUILD/$REPO_NAME/$PREPARE_PATH | awk '{ print $1 }')" >> CACHE_KEY.txt
+          echo "$SDK" >> CACHE_KEY.txt
+          echo "CACHE_KEY=$(sha256sum CACHE_KEY.txt | awk '{ print $1 }')" >> $GITHUB_ENV
+
+          echo "Configurate git for cherry-picks."
+          git config --global user.email "you@example.com"
+          git config --global user.name "Sample"
+
+      - name: Install VS 2026 Build Tools.
+        if: matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP 'vs_buildtools.exe'
+          Invoke-WebRequest -Uri https://aka.ms/vs/18/stable/vs_buildtools.exe -OutFile $exe
+          $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList `
+            '--quiet','--wait','--norestart','--nocache', `
+            '--add','Microsoft.VisualStudio.Workload.VCTools', `
+            '--add','Microsoft.VisualStudio.Component.VC.Tools.ARM64', `
+            '--add','Microsoft.VisualStudio.Component.VC.ATL.ARM64'
+          Remove-Item $exe -Force -ErrorAction SilentlyContinue
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { exit $p.ExitCode }
+
+      - uses: Eden-CI/msvc-dev-cmd@master
+        name: Native Tools Command Prompt.
+        with:
+          arch: ${{ matrix.arch }}
+          sdk: ${{ env.SDK }}
+          toolset: ${{ case(matrix.arch == 'arm64', '', '14.44') }}
+
+      - name: NuGet sources.
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      - name: Restore ThirdParty cache.
+        id: cache-third-party
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: ${{ runner.OS }}-${{ runner.arch }}-third-party-${{ env.CACHE_KEY }}
+          restore-keys: ${{ runner.OS }}-${{ runner.arch }}-third-party-
+
+      - name: Restore libraries cache.
+        id: cache-libs
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.OS }}-${{ matrix.arch }}-libs-v3-${{ env.CACHE_KEY }}
+          restore-keys: ${{ runner.OS }}-${{ matrix.arch }}-libs-v3-
+
+      - name: Restore Qt cache.
+        id: cache-qt
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.OS }}-${{ matrix.arch }}-${{ matrix.qt || 'qt' }}-${{ env.CACHE_KEY }}
+          restore-keys: ${{ runner.OS }}-${{ matrix.arch }}-${{ matrix.qt || 'qt' }}-
+
+      - name: Libraries.
+        id: build-libs
+        run: |
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat skip-debug skip-dump-syms silent ${{ matrix.qt }}
+
+      - name: Read configuration matrix.
+        shell: bash
+        run: |
+          cd "$TBUILD/$REPO_NAME"
+          ARTIFACT_NAME="Yurigram_Win"
+          VERSION="$REPO_TAG"
+
+          ARCH=""
+          if [ -n "${{ matrix.arch }}" ]; then
+            case "${{ matrix.arch }}" in
+              x64_x86) ARCH="x86";;
+              arm64) ARCH="arm";;
+              *) ARCH="${{ matrix.arch }}";;
+            esac
+            echo "Architecture from matrix: $ARCH"
+            ARTIFACT_NAME="${ARTIFACT_NAME}_${VERSION}_${ARCH}"
+          fi
+
+          if [ -n "${{ matrix.qt }}" ]; then
+            ARTIFACT_NAME="${ARTIFACT_NAME}_${{ matrix.qt }}"
+          fi
+
+          GENERATOR=""
+          if [ -n "${{ matrix.generator }}" ]; then
+            GENERATOR="-G \"${{ matrix.generator }}\""
+            echo "Generator from matrix: $GENERATOR"
+          fi
+          echo "TDESKTOP_BUILD_GENERATOR=$GENERATOR" >> $GITHUB_ENV
+
+          [ -n "$GENERATOR" ] && ARCH=""
+          echo "TDESKTOP_BUILD_ARCH=$ARCH" >> $GITHUB_ENV
+
+          API="-D TDESKTOP_API_ID=\"${{ secrets.API_ID }}\" -D TDESKTOP_API_HASH=\"${{ secrets.API_HASH }}\""
+          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> $GITHUB_ENV
+          echo "TDESKTOP_BUILD_API=$API" >> $GITHUB_ENV
+
+      # Cached Rust sources and generated bindings are needed by later builds.
+      - name: Free up some disk space.
+        shell: pwsh
+        run: |
+          bash -lc 'find "$LibrariesPath" \( \( ! \( -name "*.lib" -o -name "*.a" -o -name "*.exe" -o -name "*.h" -o -name "*.hpp" -o -name "*.inc" -o -name "*.cmake" -o -path "*/include/*" -o -path "*/gas-preprocessor/*" -o -path "*/local/lib/pkgconfig/*" -o -path "*/nv-codec-headers/*" -o -path "*/objects-*" -o -path "*/cache_keys/*" -o -path "*/patches/*" -o -path "*/src/wallet_engine/*" -o \( \( -path "*/tlottie/*" -o -path "*/wallet-engine/*" \) ! -path "*/target/*" \) \) -type f \) -o \( -empty ! -path "*/tlottie/*" ! -path "*/wallet-engine/*" \) \) -delete'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $cacheDirectories = @(
+            "$env:TBUILD\ThirdParty\msys64\var\cache\pacman\pkg",
+            "$env:TBUILD\ThirdParty\msys64\tmp",
+            "$env:USERPROFILE\.nuget\packages",
+            "$env:LOCALAPPDATA\NuGet\http-cache",
+            "$env:LOCALAPPDATA\NuGet\plugins-cache",
+            "$env:LOCALAPPDATA\NuGet\v3-cache",
+            "$env:LOCALAPPDATA\pip\Cache",
+            "$env:LOCALAPPDATA\npm-cache",
+            "$env:ProgramData\chocolatey\cache"
+          )
+          foreach ($path in $cacheDirectories) {
+            if (Test-Path -LiteralPath $path) {
+              Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          Get-PSDrive -PSProvider FileSystem |
+            Select-Object Name,
+              @{ Name = 'FreeGiB'; Expression = { [math]::Round($_.Free / 1GB, 2) } },
+              @{ Name = 'UsedGiB'; Expression = { [math]::Round($_.Used / 1GB, 2) } } |
+            Format-Table -AutoSize
+
+      - name: Telegram Desktop build.
+        if: env.ONLY_CACHE == 'false'
+        run: |
+          cd %TBUILD%\%REPO_NAME%\Telegram
+
+          call configure.bat ^
+          %TDESKTOP_BUILD_GENERATOR% ^
+          %TDESKTOP_BUILD_ARCH% ^
+          ${{ matrix.qt }} ^
+          %TDESKTOP_BUILD_API% ^
+          -D CMAKE_C_FLAGS="/WX" ^
+          -D CMAKE_CXX_FLAGS="/WX" ^
+          -D CMAKE_MSVC_DEBUG_INFORMATION_FORMAT:STRING= ^
+          -D DESKTOP_APP_DISABLE_AUTOUPDATE=OFF ^
+          -D YURIGRAM_BUILD_UPDATE_TOOLS=ON ^
+          -D DESKTOP_APP_DISABLE_CRASH_REPORTS=OFF ^
+          -D DESKTOP_APP_NO_PDB=ON -U DESKTOP_APP_DISABLE_X11_INTEGRATION
+          if errorlevel 1 exit /b 1
+
+          cmake --build ..\out --config Release --parallel
+
+      - name: Move artifact.
+        if: env.UPLOAD_ARTIFACT == 'true'
+        run: |
+          set OUT=%TBUILD%\%REPO_NAME%\out\Release
+          mkdir artifact
+          move %OUT%\Yurigram.exe artifact/
+          copy /Y "%OUT%\Updater.exe" artifact\
+          if errorlevel 1 exit /b 1
+
+      - uses: actions/upload-artifact@v7
+        name: Upload artifact.
+        if: env.UPLOAD_ARTIFACT == 'true'
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: artifact\
+          retention-days: 1
+
+      - name: Pack and sign update.
+        id: pack-update
+        if: env.UPLOAD_ARTIFACT == 'true' && env.ONLY_CACHE == 'false'
+        shell: pwsh
+        env:
+          UPDATE_SIGNING_PRIVATE_KEY: ${{ secrets.UPDATE_SIGNING_PRIVATE_KEY }}
+          UPDATE_SIGNING_KEY_ID: yurigram-release-20261011
+          UPDATE_TARGET: ${{ matrix.arch == 'arm64' && 'winarm' || 'win64' }}
+          UPDATE_ARCH: ${{ matrix.arch == 'arm64' && 'arm' || 'x64' }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:UPDATE_SIGNING_PRIVATE_KEY)) {
+            throw 'The UPDATE_SIGNING_PRIVATE_KEY secret must contain the release Ed25519 private key in PEM format.'
+          }
+          $repo = Join-Path $env:TBUILD $env:REPO_NAME
+          $header = Get-Content -LiteralPath "$repo\Telegram\SourceFiles\core\version.h" -Raw
+          $version = [regex]::Match($header, '(?m)^constexpr auto AppVersion = ([0-9]+);').Groups[1].Value
+          if (!$version) { throw 'Could not read AppVersion from core/version.h.' }
+
+          $payload = Join-Path $env:RUNNER_TEMP 'yurigram-update-payload'
+          $artifact = Join-Path $env:GITHUB_WORKSPACE 'update-artifact'
+          New-Item -ItemType Directory -Path $payload, $artifact | Out-Null
+          Copy-Item -LiteralPath 'artifact\Yurigram.exe' -Destination "$payload\Telegram.exe"
+          Copy-Item -LiteralPath 'artifact\Updater.exe' -Destination "$payload\Updater.exe"
+
+          $keyFile = Join-Path $env:RUNNER_TEMP 'yurigram-update-release-private.pem'
+          try {
+            [System.IO.File]::WriteAllText($keyFile, $env:UPDATE_SIGNING_PRIVATE_KEY, [System.Text.UTF8Encoding]::new($false))
+            Remove-Item Env:UPDATE_SIGNING_PRIVATE_KEY
+            Push-Location $payload
+            try {
+              & "$repo\out\Release\Packer.exe" `
+                -path Telegram.exe -path Updater.exe `
+                -target $env:UPDATE_TARGET -version $version `
+                -channel stable -keys-loc "$repo\Telegram\Resources\update" `
+                -local-key $keyFile -local-key-id $env:UPDATE_SIGNING_KEY_ID
+              if ($LASTEXITCODE -ne 0) { throw "Packer failed with exit code $LASTEXITCODE." }
+              $packageName = "td-update-win-$($env:UPDATE_ARCH)-$version"
+              Move-Item -LiteralPath $packageName -Destination $artifact
+              $package = Join-Path $artifact $packageName
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "package=$package"
+            } finally {
+              Pop-Location
+            }
+          } finally {
+            Remove-Item -LiteralPath $keyFile -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload update artifact.
+        if: env.UPLOAD_ARTIFACT == 'true' && env.ONLY_CACHE == 'false'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_NAME }}_Update
+          path: update-artifact/td-update-*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Package release artifact.
+        id: package-release
+        if: env.UPLOAD_ARTIFACT == 'true'
+        shell: pwsh
+        run: |
+          $archive = "$env:ARTIFACT_NAME.zip"
+          Compress-Archive -Path "artifact\*" -DestinationPath $archive
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "archive=$archive"
+
+      - name: Upload release package.
+        if: env.UPLOAD_ARTIFACT == 'true'
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ inputs.tag }}
+          file: ${{ steps.package-release.outputs.archive }}
+
+      - name: Publish Telegram update.
+        if: env.UPLOAD_ARTIFACT == 'true' && env.ONLY_CACHE == 'false'
+        timeout-minutes: 20
+        env:
+          UPDATE_API_ID: ${{ secrets.UPDATE_API_ID }}
+          UPDATE_API_HASH: ${{ secrets.UPDATE_API_HASH }}
+          UPDATE_BOT_TOKEN: ${{ secrets.UPDATE_BOT_TOKEN }}
+          UPDATE_CHAT_ID: ${{ secrets.UPDATE_CHAT_ID }}
+          UPDATE_PLATFORM: ${{ matrix.arch == 'arm64' && 'winarm' || 'win64' }}
+          UPDATE_PACKAGE: ${{ steps.pack-update.outputs.package }}
+        run: |
+          python -m venv "%RUNNER_TEMP%\yurigram-update-publisher"
+          if errorlevel 1 exit /b 1
+          set "UPDATE_PYTHON=%RUNNER_TEMP%\yurigram-update-publisher\Scripts\python.exe"
+          "%UPDATE_PYTHON%" -m pip install Telethon==1.45.0
+          if errorlevel 1 exit /b 1
+          "%UPDATE_PYTHON%" "%TBUILD%\%REPO_NAME%\Telegram\build\publish_update.py" --platform "%UPDATE_PLATFORM%" --package "%UPDATE_PACKAGE%" --chat-id "%UPDATE_CHAT_ID%"
+
+      - name: Save ThirdParty cache.
+        if: always() && steps.cache-third-party.outcome == 'success' && steps.build-libs.outcome == 'success' && steps.cache-third-party.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: ${{ steps.cache-third-party.outputs.cache-primary-key }}
+
+      - name: Save libraries cache.
+        if: always() && steps.cache-libs.outcome == 'success' && steps.build-libs.outcome == 'success' && steps.cache-libs.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ steps.cache-libs.outputs.cache-primary-key }}
+
+      - name: Save Qt cache.
+        if: always() && steps.cache-qt.outcome == 'success' && steps.build-libs.outcome == 'success' && steps.cache-qt.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ steps.cache-qt.outputs.cache-primary-key }}
